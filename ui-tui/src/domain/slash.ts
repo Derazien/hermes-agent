@@ -8,8 +8,6 @@ export const sessionScopedModelArg = (value: string) => {
   return kept.length ? `${kept.join(' ')} --session` : ''
 }
 
-export const looksLikeSlashCommand = (text: string) => /^\/[^\s/]*(?:\s|$)/.test(text)
-
 // A `/` means two different things depending on where it sits:
 //
 //  - At position 0 it's a COMMAND invocation the TUI executes
@@ -47,12 +45,6 @@ export const inlineSlashTrigger = (text: string): { query: string; start: number
   return { query, start: text.length - query.length - 1 }
 }
 
-export const parseSlashCommand = (cmd: string) => {
-  const [name = '', ...rest] = cmd.slice(1).split(/\s+/)
-
-  return { arg: rest.join(' '), cmd, name: name.toLowerCase() }
-}
-
 /**
  * Apply a completion row to the current input, mirroring the editor's
  * replace semantics: replace from `compReplace` with the row text, dropping
@@ -86,9 +78,14 @@ export const applyCompletion = (value: string, rowText: string, compReplace: num
 export const completionToApplyOnSubmit = (
   value: string,
   rowText: string | undefined,
-  compReplace: number
+  compReplace: number,
+  isLocalCommand: (name: string) => boolean = () => false
 ): string | null => {
-  if (!rowText) {
+  // The gateway does not know TUI-local commands, so its fuzzy list can rank another command
+  // above one typed in full (`/connectors` matches a description word of `/login`).
+  const typed = value.trim()
+
+  if (!rowText || (/^\/[\w-]+$/.test(typed) && isLocalCommand(typed.slice(1)))) {
     return null
   }
 
