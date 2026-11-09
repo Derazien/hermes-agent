@@ -116,6 +116,28 @@ SESSION_COORDINATION_UNAVAILABLE = "SESSION_COORDINATION_UNAVAILABLE"
 # enforcement without this file changing.
 PER_SESSION_EXCLUSIVE_SUBMIT = True
 
+# Lease heartbeat. An owner that opts in (``heartbeat=True``) refreshes its entry every
+# LEASE_HEARTBEAT_SECONDS; an opted-in entry that has not been refreshed for LEASE_EXPIRY_SECONDS is
+# dropped at the next registry read, so a backend that is alive but has lost its client (or is frozen)
+# stops holding the chat. Entries written without a heartbeat (CLI, messaging gateway, older builds)
+# keep the old rule: held until the process dies. Module attributes so tests can shorten them.
+LEASE_HEARTBEAT_SECONDS = 15.0
+LEASE_EXPIRY_SECONDS = 60.0
+
+# The loopback origin this process serves ``/api/session-attach`` on (set by ``hermes serve`` once it is bound to a
+# loopback address). Backends put it in their lease metadata as ``shared_runtime_url`` so another window or
+# terminal can attach to the owner as a watcher instead of being refused. None = not advertised.
+_SHARED_RUNTIME_URL: Optional[str] = None
+
+
+def set_shared_runtime_url(url: Optional[str]) -> None:
+    global _SHARED_RUNTIME_URL
+    _SHARED_RUNTIME_URL = url or None
+
+
+def shared_runtime_url() -> Optional[str]:
+    return _SHARED_RUNTIME_URL
+
 
 class ActiveSessionRefusal(str):
     """Refusal message (a ``str``, so callers are untouched) with a machine-readable ``reason``."""
@@ -359,6 +381,12 @@ def _pid_liveness(pid: Any, process_start_time: Any = None, *, lenient: bool = F
     return abs(current_start - expected_start) < 0.001
 
 
+def _lease_expired(entry: dict[str, Any], now: float) -> bool:
+    """True for an opted-in lease whose last heartbeat is older than the expiry. No ``heartbeat_at`` = never expires."""
+    beat = _optional_float(entry.get("heartbeat_at"))
+    return beat is not None and (now - beat) > LEASE_EXPIRY_SECONDS
+
+
 def _prune_dead(
     entries: list[dict[str, Any]], *, strict: bool = False,
     target_session_id: str | None = None, target_pid: int | None = None,
@@ -375,7 +403,13 @@ def _prune_dead(
     """
     targeted = target_session_id is not None or target_pid is not None
     live: list[dict[str, Any]] = []
+    now = time.time()
     for entry in entries:
+        if _lease_expired(entry, now):
+            logger.info(
+                "Dropped lease %s for session %s: no heartbeat for over %ds",
+                entry.get("lease_id"), entry.get("session_id"), int(LEASE_EXPIRY_SECONDS))
+            continue
         tracked = strict or bool(entry.get("track_liveness"))
         state = _pid_liveness(
             entry.get("pid"), entry.get("process_start_time"), lenient=not tracked
@@ -408,6 +442,7 @@ class ActiveSessionLease:
     state_path: Optional[Path] = None
     lock_path: Optional[Path] = None
     track_liveness: bool = False
+    heartbeat: bool = False
 
     def release(self) -> None:
         if self.released or not self.enabled:
@@ -460,7 +495,7 @@ def _read_live_entries(
 
 def _lease_entry(
     *, lease_id: str, session_id: str, surface: str,
-    metadata: Optional[dict[str, Any]] = None, track_liveness: bool = False,
+    metadata: Optional[dict[str, Any]] = None, track_liveness: bool = False, heartbeat: bool = False,
 ) -> dict[str, Any]:
     now = time.time()
     entry: dict[str, Any] = {
@@ -474,6 +509,8 @@ def _lease_entry(
     }
     if track_liveness:
         entry["track_liveness"] = True
+    if heartbeat:
+        entry["heartbeat_at"] = now
     if metadata:
         entry["metadata"] = _clean_metadata(metadata)
     return entry
@@ -481,7 +518,7 @@ def _lease_entry(
 
 def try_acquire_active_session(
     *, session_id: str, surface: str, config: Any, metadata: Optional[dict[str, Any]] = None,
-    registry_home: str | Path | None = None, track_liveness: bool = False,
+    registry_home: str | Path | None = None, track_liveness: bool = False, heartbeat: bool = False,
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
     """Acquire an active-session slot: ``(lease, None)`` or ``(None, ActiveSessionRefusal)``.
 
@@ -506,12 +543,12 @@ def try_acquire_active_session(
 
     entry = _lease_entry(
         lease_id=lease_id, session_id=key, surface=str(surface), metadata=metadata,
-        track_liveness=track_liveness,
+        track_liveness=track_liveness, heartbeat=heartbeat,
     )
     state_path, lock_path = _lease_paths(registry_home=registry_home)
     lease = ActiveSessionLease(
         lease_id=lease_id, session_id=key, surface=str(surface), state_path=state_path,
-        lock_path=lock_path, track_liveness=track_liveness,
+        lock_path=lock_path, track_liveness=track_liveness, heartbeat=heartbeat,
     )
     with _FileLock(lock_path):
         # A capacity cap could degrade open; exclusivity cannot: "could not
@@ -593,6 +630,29 @@ def release_active_session(lease: ActiveSessionLease) -> None:
         lease.released = True
 
 
+def heartbeat_active_session(lease: ActiveSessionLease) -> bool:
+    """Refresh ``lease``'s heartbeat. False only when the registry PROVES the lease is gone (expired and pruned, or
+    taken over); the owner must then drop its reference and re-claim on its next turn. An unreadable registry or a
+    lease that does not heartbeat is not a loss (True): unknown never ends a session."""
+    if not lease.enabled or lease.released or not lease.heartbeat:
+        return True
+    state_path, lock_path = _lease_paths(lease)
+    try:
+        with _FileLock(lock_path):
+            entries = _read_entries(state_path, strict=True)
+            now = time.time()
+            for entry in entries:
+                if str(entry.get("lease_id") or "") == lease.lease_id:
+                    entry["updated_at"] = now
+                    entry["heartbeat_at"] = now
+                    _write_entries(state_path, entries)
+                    return True
+            return False
+    except (ActiveSessionRegistryError, RuntimeError, OSError):
+        logger.debug("lease heartbeat could not reach the registry", exc_info=True)
+        return True
+
+
 def transfer_active_session(
     lease: ActiveSessionLease, *, session_id: str, metadata: Optional[dict[str, Any]] = None
 ) -> bool:
@@ -623,12 +683,14 @@ def transfer_active_session(
         if own is not None:
             own["session_id"] = new_session_id
             own["updated_at"] = time.time()
+            if lease.heartbeat:
+                own["heartbeat_at"] = own["updated_at"]
             if metadata:
                 own["metadata"] = _clean_metadata(metadata)
         elif lease.track_liveness:
             entries.append(_lease_entry(
                 lease_id=lease.lease_id, session_id=new_session_id, surface=lease.surface,
-                metadata=metadata, track_liveness=True,
+                metadata=metadata, track_liveness=True, heartbeat=lease.heartbeat,
             ))
         else:
             return False

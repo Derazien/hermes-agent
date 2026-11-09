@@ -775,6 +775,13 @@ def _(rid, params: dict) -> dict:
         # Refused HERE — before the busy queue, db row and agent build — so a refusal
         # leaves the session untouched.  The reason travels as machine-readable data.
         reason = getattr(limit_message, "reason", None)
+        # Another live window owns the chat: queue the send for it instead of refusing. Not for truncating
+        # submits (a rewind cannot wait behind someone else's turn) or internal hosted-room submits.
+        if (reason == "SESSION_NOT_OWNED" and not internal_hosted_submit
+                and not any(params.get(k) is not None for k in _TRUNCATION_PARAMS)):
+            queued = _queue_for_other_owner(rid, session, text)
+            if queued is not None:
+                return queued
         return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None)
     # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
     session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""

@@ -1045,6 +1045,7 @@ from hermes_cli.web_routers import (
     chat_workspaces as _chat_workspaces_routes,
     dashboard_ui as _dashboard_ui_routes,
     shared_metrics as _shared_metrics_routes,
+    session_attach as _session_attach_routes,
 )
 
 app.include_router(_files_routes.router)
@@ -1078,6 +1079,7 @@ app.include_router(_chat_ws_routes.router)
 app.include_router(_chat_workspaces_routes.router)
 app.include_router(_dashboard_ui_routes.router)
 app.include_router(_shared_metrics_routes.router)
+app.include_router(_session_attach_routes.router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth
@@ -1458,6 +1460,12 @@ def _on_server_started(
 
     actual_port = _read_bound_port(server, fallback=port)
     app.state.bound_port = actual_port
+    # A loopback-bound backend tells other windows where to attach as watchers (lease metadata
+    # ``shared_runtime_url``; the route is /api/session-attach). Never advertised for a non-loopback bind.
+    if str(host).strip().lower() in {"127.0.0.1", "localhost", "::1"}:
+        from hermes_cli.active_sessions import set_shared_runtime_url
+
+        set_shared_runtime_url(f"http://127.0.0.1:{actual_port}")
     # Published by /api/host/identity: an attaching `hermes dashboard` must never be routed to a
     # headless backend (a URL with no UI behind it).
     app.state.serves_spa = not headless

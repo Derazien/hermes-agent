@@ -130,6 +130,10 @@ def _admit_prompt_turn(
         with session["history_lock"]:
             session["running"] = False
             session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
+        # The lease went to another window between submit and run: hand the text to its owner, never drop it.
+        if getattr(ownership_refusal, "reason", None) == "SESSION_NOT_OWNED" and _queue_text_for_other_owner(session, text):
+            _emit("error", sid, {"message": _QUEUED_FOR_OWNER_MESSAGE})
+            return None
         _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:

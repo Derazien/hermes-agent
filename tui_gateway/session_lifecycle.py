@@ -6,6 +6,8 @@ globals at install time (method_ctx.bind_module), so they reference server.py gl
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 import contextlib
 
@@ -63,7 +65,11 @@ _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "
 def _lease_metadata(live_session_id: str) -> dict:
     """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``; the delivery flag is
     what Bot Chat gates live delivery on (session_notifications)."""
-    return {"live_session_id": live_session_id, "bot_live_delivery_consumer": True}
+    meta = {"live_session_id": live_session_id, "bot_live_delivery_consumer": True}
+    from hermes_cli.active_sessions import shared_runtime_url
+    if (url := shared_runtime_url()):
+        meta["shared_runtime_url"] = url  # other windows attach here as watchers (hermes_cli.shared_session_attach)
+    return meta
 
 
 def _claim_active_session_slot(
@@ -74,7 +80,8 @@ def _claim_active_session_slot(
         return try_acquire_active_session(
             session_id=session_key, surface=surface, config=_load_cfg(), registry_home=profile_home,
             metadata=_lease_metadata(live_session_id),
-            track_liveness=str(surface or "").strip().lower() == "desktop")
+            track_liveness=str(surface or "").strip().lower() == "desktop",
+            heartbeat=True)  # this backend beats it (_lease_ticker_loop); a lease nobody refreshes expires
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
         # Fail CLOSED: an errored claim has NOT proven the session unowned; lease-less = silent double-writer hole.
@@ -140,6 +147,126 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
 def _attach_lease(session: dict, lease) -> None:
     session["active_session_lease"] = lease
     session.pop("_lease_taken_over", None)  # owning again: its finalize ends the row like any owner
+    _start_lease_ticker()
+
+
+_QUEUED_FOR_OWNER_MESSAGE = (
+    "Queued: this chat is open in another Hermes window. Your message will run there when its current turn ends."
+)
+
+
+def _queue_text_for_other_owner(session: dict, text) -> bool:
+    """Put ``text`` in the cross-process inbox of the session's stored chat. False when it cannot be queued."""
+    from hermes_cli.session_prompt_queue import enqueue_prompt
+    key = str(session.get("session_key") or "")
+    if not key or not isinstance(text, str):
+        return False
+    sender = {"surface": str(session.get("client_surface") or _session_source(session) or "")}
+    return enqueue_prompt(key, text, sender=sender, registry_home=session.get("profile_home")) is not None
+
+
+def _queue_for_other_owner(rid, session: dict, text) -> dict | None:
+    """prompt.submit answer when another window owns the chat: queued, not refused. None = could not queue."""
+    if not _queue_text_for_other_owner(session, text):
+        return None
+    return _ok(rid, {"status": "queued", "queued_for_owner": True, "message": _QUEUED_FOR_OWNER_MESSAGE})
+
+
+# ── Lease heartbeat + cross-process prompt inbox ────────────────────────────────────────────────────────────
+# One daemon thread per backend. Every LEASE_HEARTBEAT_SECONDS it refreshes the lease of each session that still
+# has a reason to hold it (a client attached, or work in flight); a session the reaper would already evict
+# (client gone, idle) is NOT refreshed, so its lease expires after LEASE_EXPIRY_SECONDS instead of blocking the
+# chat until this process dies. Every _LEASE_INBOX_POLL_S it moves prompts that another backend queued
+# (hermes_cli.session_prompt_queue) into this backend's own queue for the sessions it owns.
+_LEASE_INBOX_POLL_S = 2.0
+_lease_ticker_started = False
+_lease_ticker_lock = threading.Lock()
+
+
+def _start_lease_ticker() -> None:
+    global _lease_ticker_started
+    with _lease_ticker_lock:
+        if _lease_ticker_started:
+            return
+        _lease_ticker_started = True
+    threading.Thread(target=_lease_ticker_loop, name="hermes-lease-ticker", daemon=True).start()
+
+
+def _lease_ticker_loop() -> None:
+    from hermes_cli import active_sessions
+    last_beat = 0.0
+    while True:
+        time.sleep(_LEASE_INBOX_POLL_S)
+        try:
+            if time.monotonic() - last_beat >= active_sessions.LEASE_HEARTBEAT_SECONDS:
+                last_beat = time.monotonic()
+                _lease_heartbeat_tick()
+            _lease_inbox_tick()
+        except Exception:
+            logger.debug("lease ticker pass failed", exc_info=True)
+
+
+def _lease_heartbeat_tick() -> None:
+    """Refresh every held lease whose session still has a reason to hold it; drop a lease the registry says is gone."""
+    from hermes_cli.active_sessions import heartbeat_active_session
+    with _sessions_lock:
+        held = [(sid, s) for sid, s in _sessions.items() if s.get("active_session_lease") is not None]
+    for sid, session in held:
+        lease = session.get("active_session_lease")
+        if lease is None or not getattr(lease, "heartbeat", False):
+            continue
+        if _session_is_lru_evictable(sid, session):
+            continue  # client gone and nothing running: let the lease lapse
+        if heartbeat_active_session(lease):
+            continue
+        # Expired and pruned (or taken over). Forget it: the next turn re-claims, and is queued behind the new owner.
+        logger.info("Session %s lost its lease (expired); it will re-claim on the next turn", sid)
+        with _sessions_lock:
+            if session.get("active_session_lease") is lease:
+                session.pop("active_session_lease", None)
+
+
+def _lease_inbox_tick() -> None:
+    """For each live session with prompts waiting in the cross-process inbox: if this backend owns (or can now take)
+    the lease, queue them as ordinary next turns, in arrival order, and run the head when the session is idle."""
+    from hermes_cli.session_prompt_queue import pending_count
+    with _sessions_lock:
+        candidates = [(sid, s) for sid, s in _sessions.items()
+                      if not s.get("_closing") and not s.get("_finalized") and s.get("session_key")]
+    for sid, session in candidates:
+        key = str(session.get("session_key") or "")
+        home = session.get("profile_home")
+        if pending_count(key, home) == 0:
+            continue
+        try:
+            _deliver_inbox_prompts(sid, session, key, home)
+        except Exception:
+            logger.warning("Delivering queued prompts for session %s failed", sid, exc_info=True)
+
+
+def _deliver_inbox_prompts(sid: str, session: dict, key: str, home) -> int:
+    from hermes_cli.session_prompt_queue import ack, claim_prompts, release
+    if _ensure_active_session_slot(sid, session) is not None:
+        return 0  # another live backend owns it; its own ticker delivers
+    delivered = 0
+    for entry in claim_prompts(key, registry_home=home):
+        # No turn author: that is stamped by the relay handler only, never by a file on disk.
+        with session["history_lock"]:
+            envelope = _enqueue_prompt(session, entry.text, session.get("transport"))
+            if envelope is not None:
+                _persist_queued_user_row(session, envelope, None)  # durable at accept, like a busy-queued send
+        if envelope is None:
+            release(entry)
+            continue
+        ack(entry)
+        delivered += 1
+    if delivered:
+        logger.info("Queued %d prompt(s) from another window into session %s", delivered, sid)
+        with session["history_lock"]:
+            idle = not session.get("running")
+        if idle:
+            _drain_queued_prompt("__inbox__", sid, session)
+    return delivered
 
 
 def _detached_lease_holder(session: dict, key: str) -> tuple[str, dict] | None:
